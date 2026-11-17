@@ -2,6 +2,7 @@
 #import <objc/runtime.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #pragma mark - 日志窗口
 
@@ -102,7 +103,7 @@ static NSString *ACCsvField(NSString *value) {
     return value;
 }
 
-@interface DebugFloatWindow : NSObject <UITableViewDelegate, UITableViewDataSource>
+@interface DebugFloatWindow : NSObject <UITableViewDelegate, UITableViewDataSource, UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIWindow *floatWindow;
 @property (nonatomic, strong) UIButton *floatBtn;
 @property (nonatomic, strong) UIView *panelView;
@@ -208,6 +209,9 @@ static NSString *ACCsvField(NSString *value) {
         self.floatWindow.frame = CGRectMake(20, 100, 46, 46);
         self.floatWindow.windowLevel = UIWindowLevelAlert + 1000;
         self.floatWindow.backgroundColor = [UIColor clearColor];
+        UIViewController *hostVC = [[UIViewController alloc] init];
+        hostVC.view.backgroundColor = [UIColor clearColor];
+        self.floatWindow.rootViewController = hostVC;
         self.floatWindow.hidden = NO;
 
         self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -219,7 +223,7 @@ static NSString *ACCsvField(NSString *value) {
         [self.floatBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
         [self.floatBtn addGestureRecognizer:pan];
-        [self.floatWindow addSubview:self.floatBtn];
+        [hostVC.view addSubview:self.floatBtn];
 
         CGFloat panelW = MIN(keyWindow.bounds.size.width - 40, 420);
         CGFloat panelH = MIN(keyWindow.bounds.size.height - 80, 280);
@@ -227,6 +231,9 @@ static NSString *ACCsvField(NSString *value) {
         self.panelView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.88];
         self.panelView.layer.cornerRadius = 10;
         self.panelView.hidden = YES;
+        UIPanGestureRecognizer *panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanelPan:)];
+        panelPan.delegate = self;
+        [self.panelView addGestureRecognizer:panelPan];
 
         UIButton *exportBtn = [UIButton buttonWithType:UIButtonTypeSystem];
         exportBtn.frame = CGRectMake(10, 5, 80, 30);
@@ -328,7 +335,7 @@ static NSString *ACCsvField(NSString *value) {
 
     NSDictionary *json = ACJSONObjectFromString(trim);
     if (json) {
-        id cmd = ACFindDeep(json, @"c", 0) ?: ACFindDeep(json, @"cmd", 0);
+        id cmd = ACFindDeep(json, @"act", 0) ?: ACFindDeep(json, @"c", 0) ?: ACFindDeep(json, @"cmd", 0);
         if ([cmd isKindOfClass:[NSString class]]) {
             NSString *cmdLower = [(NSString *)cmd lowercaseString];
             if ([cmdLower isEqualToString:@"ping"] || [cmdLower isEqualToString:@"pong"]) return;
@@ -345,24 +352,37 @@ static NSString *ACCsvField(NSString *value) {
 }
 
 - (BOOL)handleJSONMessage:(NSDictionary *)json {
+    NSDictionary *dataDict = json;
+    id dataObj = json[@"data"];
+    if ([dataObj isKindOfClass:[NSDictionary class]]) dataDict = dataObj;
+
     NSArray<NSNumber *> *bets = ACBetTotalsFromJSON(json);
     if (bets) {
         self.currentBets = bets;
         [self refreshSummaryLabels];
     }
 
-    id cmdObj = ACFindDeep(json, @"c", 0) ?: ACFindDeep(json, @"cmd", 0);
-    NSString *cmd = [cmdObj isKindOfClass:[NSString class]] ? [(NSString *)cmdObj lowercaseString] : @"";
+    NSString *act = nil;
+    for (NSString *key in @[@"act", @"c", @"cmd", @"type", @"action", @"method"]) {
+        id v = dataDict[key];
+        if (![v isKindOfClass:[NSString class]]) v = ACFindDeep(json, key, 0);
+        if ([v isKindOfClass:[NSString class]]) {
+            act = [(NSString *)v lowercaseString];
+            break;
+        }
+    }
+    if (act.length == 0) act = @"";
 
-    if ([cmd containsString:@"dobet/notice"]) {
+    if ([act containsString:@"dobet/notice"] || [act containsString:@"dobet"]) {
         return YES; // 只更新押分快照，不写日志
     }
 
-    id lottery = ACFindDeep(json, @"lottery", 0);
-    BOOL isStep = [cmd containsString:@"step"];
+    id statusObj = dataDict[@"status"] ?: ACFindDeep(json, @"status", 0);
+    NSInteger status = [statusObj respondsToSelector:@selector(integerValue)] ? [statusObj integerValue] : -1;
+
+    id lottery = dataDict[@"lottery"] ?: ACFindDeep(json, @"lottery", 0);
+    BOOL isStep = [act containsString:@"step"] || ACFindDeep(json, @"round_result", 0) != nil;
     if (isStep) {
-        id statusObj = ACFindDeep(json, @"status", 0);
-        NSInteger status = [statusObj respondsToSelector:@selector(integerValue)] ? [statusObj integerValue] : -1;
         if (status == 3) {
             self.currentBets = @[@0, @0, @0, @0, @0, @0];
             [self refreshSummaryLabels];
@@ -377,11 +397,23 @@ static NSString *ACCsvField(NSString *value) {
 
 - (void)recordStepJSON:(NSDictionary *)json lottery:(NSArray *)lottery {
     NSString *round = nil;
-    for (NSString *k in @[@"cgidx", @"round", @"issue", @"qihao", @"expect", @"period"]) {
-        id v = ACFindDeep(json, k, 0);
-        if ([v isKindOfClass:[NSNumber class]] || [v isKindOfClass:[NSString class]]) {
-            round = [NSString stringWithFormat:@"%@", v];
-            break;
+    id rr = ACFindDeep(json, @"round_result", 0);
+    if ([rr isKindOfClass:[NSDictionary class]]) {
+        id roomObj = ACFindDeep(rr, @"room", 0);
+        if ([roomObj isKindOfClass:[NSDictionary class]]) {
+            id cg = ACFindDeep(roomObj, @"cgidx", 0);
+            if ([cg isKindOfClass:[NSNumber class]] || [cg isKindOfClass:[NSString class]]) {
+                round = [NSString stringWithFormat:@"%@", cg];
+            }
+        }
+    }
+    if (round.length == 0) {
+        for (NSString *k in @[@"cgidx", @"round", @"issue", @"qihao", @"expect", @"period"]) {
+            id v = ACFindDeep(json, k, 0);
+            if ([v isKindOfClass:[NSNumber class]] || [v isKindOfClass:[NSString class]]) {
+                round = [NSString stringWithFormat:@"%@", v];
+                break;
+            }
         }
     }
     if (round.length == 0) {
@@ -395,7 +427,6 @@ static NSString *ACCsvField(NSString *value) {
     NSInteger d2 = [lottery[1] integerValue];
 
     NSString *room = @"";
-    id rr = ACFindDeep(json, @"round_result", 0);
     if ([rr isKindOfClass:[NSDictionary class]]) {
         id roomObj = ACFindDeep(rr, @"room", 0);
         if ([roomObj isKindOfClass:[NSDictionary class]]) {
@@ -421,6 +452,22 @@ static NSString *ACCsvField(NSString *value) {
         ? [NSString stringWithFormat:@"%@", p] : @"";
 
     NSArray *bets = [self.currentBets copy] ?: @[@0, @0, @0, @0, @0, @0];
+    double totalBets = 0;
+    for (int i = 0; i < 6; i++) {
+        totalBets += i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
+    }
+    double betOn1 = (d1 >= 1 && d1 <= 6) ? [bets[d1 - 1] doubleValue] : 0;
+    double betOn2 = (d2 >= 1 && d2 <= 6) ? [bets[d2 - 1] doubleValue] : 0;
+    double returned = (d1 == d2) ? betOn1 * 3.0 : betOn1 * 2.0 + betOn2 * 2.0;
+    double expectedProfit = totalBets - returned;
+
+    NSString *verify = @"";
+    if (profit.length > 0) {
+        double actual = [profit doubleValue];
+        double diff = actual - expectedProfit;
+        verify = fabs(diff) < 0.5 ? @"✅一致" : [NSString stringWithFormat:@"⚠️差%.0f", diff];
+    }
+
     NSDictionary *record = @{
         @"round": round,
         @"room": room,
@@ -428,6 +475,8 @@ static NSString *ACCsvField(NSString *value) {
         @"d1": @(d1),
         @"d2": @(d2),
         @"profit": profit,
+        @"expect": @(expectedProfit),
+        @"verify": verify,
         @"time": [self timestampString]
     };
     [self.roundRecords addObject:record];
@@ -441,11 +490,11 @@ static NSString *ACCsvField(NSString *value) {
     }
     [self saveRecords];
 
-    self.resultLabel.text = [NSString stringWithFormat:@"开奖：%@ + %@   盈亏 %@   第 %@ 局",
-                             n1, n2, profit.length ? profit : @"-", round];
+    self.resultLabel.text = [NSString stringWithFormat:@"开奖：%@ + %@   盈亏 %@   第 %@ 局  %@",
+                             n1, n2, profit.length ? profit : @"-", round, verify];
     [self refreshStatsLabel];
-    [self addLog:@"[开奖]" detail:[NSString stringWithFormat:@"第 %@ 局  开 %@ + %@  盈亏 %@\n押分 虎:%.0f 芦:%.0f 狮:%.0f 蟹:%.0f 鱼:%.0f 虾:%.0f",
-                                  round, n1, n2, profit.length ? profit : @"-",
+    [self addLog:@"[开奖]" detail:[NSString stringWithFormat:@"第 %@ 局  开 %@ + %@  盈亏 %@  理论 %.0f  %@\n押分 虎:%.0f 芦:%.0f 狮:%.0f 蟹:%.0f 鱼:%.0f 虾:%.0f",
+                                  round, n1, n2, profit.length ? profit : @"-", expectedProfit, verify,
                                   [bets[0] doubleValue], [bets[1] doubleValue], [bets[2] doubleValue],
                                   [bets[3] doubleValue], [bets[4] doubleValue], [bets[5] doubleValue]]];
 }
@@ -462,7 +511,7 @@ static NSString *ACCsvField(NSString *value) {
 
 - (void)refreshStatsLabel {
     if (!self.statsLabel) return;
-    NSMutableString *text = [NSMutableString stringWithString:@"累计 "];
+    NSMutableString *text = [NSMutableString stringWithFormat:@"共%lu局  ", (unsigned long)self.roundRecords.count];
     for (int i = 0; i < 6; i++) {
         [text appendFormat:@"%@:%@  ", kACBetNames[i], self.statsDict[kACBetNames[i]] ?: @0];
     }
@@ -518,7 +567,7 @@ static NSString *ACCsvField(NSString *value) {
         [self addLog:@"[CSV]" detail:@"暂无开奖记录"];
         return;
     }
-    NSMutableString *csv = [NSMutableString stringWithString:@"\ufeff时间,房间号,局号,虎总押,芦总押,狮总押,蟹总押,鱼总押,虾总押,开奖1,开奖2,庄家盈亏\n"];
+    NSMutableString *csv = [NSMutableString stringWithString:@"\ufeff时间,房间号,局号,虎总押,芦总押,狮总押,蟹总押,鱼总押,虾总押,开奖1,开奖2,庄家盈亏,理论盈亏,账目校验\n"];
     for (NSDictionary *record in self.roundRecords) {
         NSArray *bets = [record[@"bets"] isKindOfClass:[NSArray class]] ? record[@"bets"] : @[@0, @0, @0, @0, @0, @0];
         NSMutableString *line = [NSMutableString string];
@@ -527,10 +576,12 @@ static NSString *ACCsvField(NSString *value) {
             double v = i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
             [line appendFormat:@",%.0f", v];
         }
-        [line appendFormat:@",%@,%@,%@",
+        [line appendFormat:@",%@,%@,%@,%.0f,%@",
          ACDiceName([record[@"d1"] integerValue]),
          ACDiceName([record[@"d2"] integerValue]),
-         ACCsvField(record[@"profit"])];
+         ACCsvField(record[@"profit"]),
+         [record[@"expect"] doubleValue],
+         ACCsvField(record[@"verify"])];
         [csv appendFormat:@"%@\n", line];
     }
 
@@ -573,6 +624,22 @@ static NSString *ACCsvField(NSString *value) {
     frame.origin.y += translation.y;
     self.floatWindow.frame = frame;
     [pan setTranslation:CGPointMake(0, 0) inView:self.floatWindow];
+}
+
+- (void)handlePanelPan:(UIPanGestureRecognizer *)pan {
+    UIView *superview = self.panelView.superview;
+    if (!superview) return;
+    CGPoint translation = [pan translationInView:superview];
+    self.panelView.center = CGPointMake(self.panelView.center.x + translation.x,
+                                        self.panelView.center.y + translation.y);
+    [pan setTranslation:CGPointZero inView:superview];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if (gestureRecognizer.view == self.panelView && touch.view && [touch.view isDescendantOfView:self.logTableView]) {
+        return NO; // 列表区域留给滚动
+    }
+    return YES;
 }
 
 - (void)togglePanel {
