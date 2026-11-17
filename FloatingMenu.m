@@ -28,7 +28,6 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _logDataSource = [NSMutableArray array];
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(setupUI)
                                                      name:UIApplicationDidBecomeActiveNotification
@@ -38,6 +37,13 @@
         });
     }
     return self;
+}
+
+- (NSMutableArray<NSDictionary *> *)logDataSource {
+    if (!_logDataSource) {
+        _logDataSource = [NSMutableArray array];
+    }
+    return _logDataSource;
 }
 
 - (UIWindow *)getKeyWindow {
@@ -58,8 +64,11 @@
 - (void)setupUI {
     if (self.floatWindow) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        static BOOL sSetupDone = NO;
+        if (sSetupDone) return;
         UIWindow *keyWindow = [self getKeyWindow];
         if (!keyWindow) return;
+        sSetupDone = YES;
 
         if (@available(iOS 13.0, *)) {
             if (keyWindow.windowScene) {
@@ -152,17 +161,23 @@
 }
 
 - (void)addLog:(NSString *)title detail:(NSString *)detail {
+    // 跨线程前先复制，避免调用方临时字符串在异步切换后失效
+    NSString *safeTitle = title ? [NSString stringWithFormat:@"%@", title] : @"";
+    NSString *safeDetail = detail ? [NSString stringWithFormat:@"%@", detail] : @"";
+
     dispatch_async(dispatch_get_main_queue(), ^{
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
         fmt.dateFormat = @"HH:mm:ss.SSS";
+        NSString *timeStr = [fmt stringFromDate:[NSDate date]] ?: @"";
+
         NSDictionary *item = @{
-            @"time": [fmt stringFromDate:[NSDate date]],
-            @"title": title ?: @"",
-            @"detail": detail ?: @""
+            @"time": timeStr,
+            @"title": safeTitle,
+            @"detail": safeDetail
         };
         [self.logDataSource insertObject:item atIndex:0];
         if (self.logDataSource.count > 200) [self.logDataSource removeLastObject];
-        [self.logTableView reloadData];
+        if (self.logTableView) [self.logTableView reloadData];
     });
 }
 

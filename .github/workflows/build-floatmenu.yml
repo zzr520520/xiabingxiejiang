@@ -17,7 +17,7 @@ jobs:
       - name: Compile dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 \
+          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc \
             -isysroot "$SDK" -miphoneos-version-min=14.0 \
             -framework UIKit -framework Foundation \
             -install_name @executable_path/Frameworks/libFloatingMenu.dylib \
