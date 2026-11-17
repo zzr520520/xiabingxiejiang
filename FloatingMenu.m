@@ -632,7 +632,7 @@ static NSString *ACCsvField(NSString *value) {
     CGPoint translation = [pan translationInView:superview];
     self.panelView.center = CGPointMake(self.panelView.center.x + translation.x,
                                         self.panelView.center.y + translation.y);
-    [pan setTranslation:CGPointZero inView:superview];
+    [pan setTranslation:CGPointMake(0, 0) inView:superview];
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
