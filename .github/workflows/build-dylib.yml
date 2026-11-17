@@ -1,0 +1,32 @@
+name: Build AppGuardFix dylib
+
+on:
+  push:
+    paths:
+      - 'AppGuardFix.m'
+      - '.github/workflows/build-dylib.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 \
+            -isysroot "$SDK" -miphoneos-version-min=14.0 \
+            -framework Foundation \
+            -o libAppGuardFix.dylib AppGuardFix.m
+          codesign -f -s - libAppGuardFix.dylib
+          lipo -info libAppGuardFix.dylib
+          otool -L libAppGuardFix.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppGuardFix-dylib
+          path: libAppGuardFix.dylib
