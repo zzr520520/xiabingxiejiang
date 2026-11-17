@@ -119,6 +119,8 @@ static NSString *ACCsvField(NSString *value) {
 @property (nonatomic, strong) UIView *analyticsView;
 @property (nonatomic, strong) UITextView *analyticsTextView;
 @property (nonatomic, strong) UILabel *headerInfoLabel;
+@property (nonatomic, strong) UIButton *exportBtn;
+@property (nonatomic, strong) UILabel *statsHeaderLabel;
 @property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *allSessions;
 @property (nonatomic, strong) NSMutableDictionary *activeSession;
 @property (nonatomic, strong) NSArray<NSNumber *> *currentBets;
@@ -131,7 +133,11 @@ static NSString *ACCsvField(NSString *value) {
 - (BOOL)handleJSONMessage:(NSDictionary *)json;
 - (void)recordStepJSON:(NSDictionary *)json lottery:(NSArray *)lottery;
 - (void)updateAnalyticsReport;
+- (void)onExportTapped;
 - (void)exportCurrentSessionCSV;
+- (void)exportAllSessionsCSV;
+- (UIView *)roundsStatsHeaderView;
+- (NSParagraphStyle *)analyticsTabStyle;
 - (void)presentShareForFile:(NSString *)path sourceRect:(CGRect)rect;
 - (NSString *)dataDirectory;
 - (void)saveSessions;
@@ -288,7 +294,8 @@ static NSString *ACCsvField(NSString *value) {
         [exportBtn setTitle:@"导出本场" forState:UIControlStateNormal];
         [exportBtn setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
         exportBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-        [exportBtn addTarget:self action:@selector(exportCurrentSessionCSV) forControlEvents:UIControlEventTouchUpInside];
+        [exportBtn addTarget:self action:@selector(onExportTapped) forControlEvents:UIControlEventTouchUpInside];
+        self.exportBtn = exportBtn;
         [self.panelView addSubview:exportBtn];
 
         UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -351,6 +358,10 @@ static NSString *ACCsvField(NSString *value) {
         self.headerInfoLabel.text = [NSString stringWithFormat:@"房号:%@ | 已开%lu局 | 庄总盈:%@",
                                      sess[@"room"] ?: @"-", (unsigned long)rounds.count, sess[@"totalProfit"] ?: @0];
     }
+    if (self.exportBtn) {
+        [self.exportBtn setTitle:(self.currentTabIndex == 1 ? @"全选导出" : @"导出本场")
+                        forState:UIControlStateNormal];
+    }
     if (self.currentTabIndex == 2) {
         self.mainTableView.hidden = YES;
         self.analyticsView.hidden = NO;
@@ -358,7 +369,16 @@ static NSString *ACCsvField(NSString *value) {
     } else {
         self.mainTableView.hidden = NO;
         self.analyticsView.hidden = YES;
+        self.mainTableView.tableHeaderView = (self.currentTabIndex == 0) ? [self roundsStatsHeaderView] : nil;
         [self.mainTableView reloadData];
+    }
+}
+
+- (void)onExportTapped {
+    if (self.currentTabIndex == 1) {
+        [self exportAllSessionsCSV];
+    } else {
+        [self exportCurrentSessionCSV];
     }
 }
 
@@ -560,24 +580,97 @@ static NSString *ACCsvField(NSString *value) {
         }
     }
 
-    NSMutableString *report = [NSMutableString string];
-    [report appendFormat:@"房间 %@  共 %ld 局\n", sess[@"room"], (long)total];
-    [report appendFormat:@"庄累计盈亏：%@   同点局：%ld\n", sess[@"totalProfit"], (long)sameCount];
+    UIFont *font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    UIFont *boldFont = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
+    NSMutableParagraphStyle *plainStyle = [[NSMutableParagraphStyle alloc] init];
+    plainStyle.lineSpacing = 2;
+    NSDictionary *plainAttr = @{NSFontAttributeName: font,
+                                NSForegroundColorAttributeName: [UIColor whiteColor],
+                                NSParagraphStyleAttributeName: plainStyle};
+    NSDictionary *titleAttr = @{NSFontAttributeName: boldFont,
+                                NSForegroundColorAttributeName: [UIColor systemYellowColor],
+                                NSParagraphStyleAttributeName: plainStyle};
+    NSDictionary *rowAttr = @{NSFontAttributeName: font,
+                              NSForegroundColorAttributeName: [UIColor whiteColor],
+                              NSParagraphStyleAttributeName: [self analyticsTabStyle]};
+    NSDictionary *headAttr = @{NSFontAttributeName: boldFont,
+                               NSForegroundColorAttributeName: [UIColor systemYellowColor],
+                               NSParagraphStyleAttributeName: [self analyticsTabStyle]};
+
+    NSMutableAttributedString *report = [[NSMutableAttributedString alloc] initWithString:@""];
+    [report appendAttributedString:[[NSAttributedString alloc] initWithString:
+        [NSString stringWithFormat:@"房间 %@   共 %ld 局\n", sess[@"room"], (long)total] attributes:titleAttr]];
+    [report appendAttributedString:[[NSAttributedString alloc] initWithString:
+        [NSString stringWithFormat:@"庄累计盈亏：%@   同点局：%ld\n", sess[@"totalProfit"], (long)sameCount] attributes:plainAttr]];
     if (heavyValid > 0) {
-        [report appendFormat:@"最大押分门命中率：%.1f%% (%ld/%ld)\n",
-         (double)heavyHit / heavyValid * 100.0, (long)heavyHit, (long)heavyValid];
+        [report appendAttributedString:[[NSAttributedString alloc] initWithString:
+            [NSString stringWithFormat:@"最大押分门命中率：%.1f%% (%ld/%ld)\n",
+             (double)heavyHit / heavyValid * 100.0, (long)heavyHit, (long)heavyValid] attributes:plainAttr]];
     }
-    [report appendString:@"------------------------------\n"];
-    [report appendString:@"门类  押分合计  骰数  局命中  命中率\n"];
+    [report appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:plainAttr]];
+    [report appendAttributedString:[[NSAttributedString alloc] initWithString:
+        @"门类\t押分\t骰数\t局命中\t命中率\n" attributes:headAttr]];
     for (int i = 0; i < 6; i++) {
-        [report appendFormat:@" %@   %8.0f   %3ld   %3ld   %5.1f%%\n",
-         kACBetNames[i], betSums[i], (long)diceCounts[i], (long)hits[i],
-         (double)hits[i] / total * 100.0];
+        NSString *line = [NSString stringWithFormat:@"%@\t%.0f\t%ld\t%ld\t%.1f%%\n",
+                          kACBetNames[i], betSums[i], (long)diceCounts[i], (long)hits[i],
+                          (double)hits[i] / total * 100.0];
+        [report appendAttributedString:[[NSAttributedString alloc] initWithString:line attributes:rowAttr]];
     }
-    [report appendString:@"------------------------------\n"];
-    [report appendString:@"理论参考：单门至少出现一次 30.6%\n"];
-    [report appendFormat:@"样本量 %ld 局，偏差需上百局才有统计意义。", (long)total];
-    self.analyticsTextView.text = report;
+    [report appendAttributedString:[[NSAttributedString alloc] initWithString:
+        @"\n理论参考：单门至少出现一次 30.6%%\n" attributes:plainAttr]];
+    [report appendAttributedString:[[NSAttributedString alloc] initWithString:
+        [NSString stringWithFormat:@"样本量 %ld 局，偏差需上百局才有统计意义。", (long)total] attributes:plainAttr]];
+    self.analyticsTextView.attributedText = report;
+}
+
+- (NSParagraphStyle *)analyticsTabStyle {
+    CGFloat w = MAX(self.analyticsTextView.bounds.size.width - 10, 240);
+    NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+    NSMutableArray<NSTextTab *> *tabs = [NSMutableArray array];
+    CGFloat fracs[4] = {0.22, 0.46, 0.66, 0.82};
+    for (int i = 0; i < 4; i++) {
+        [tabs addObject:[[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentLeft
+                                                        location:w * fracs[i]
+                                                         options:@{}]];
+    }
+    ps.tabStops = tabs;
+    ps.lineSpacing = 2;
+    return ps;
+}
+
+#pragma mark - 本场出现次数统计
+
+- (UIView *)roundsStatsHeaderView {
+    NSArray *rounds = [self ensureActiveSession][@"rounds"];
+    if (![rounds isKindOfClass:[NSArray class]]) rounds = @[];
+
+    NSInteger counts[6] = {0};
+    for (NSDictionary *r in rounds) {
+        NSInteger d1 = [r[@"d1"] integerValue];
+        NSInteger d2 = [r[@"d2"] integerValue];
+        if (d1 >= 1 && d1 <= 6) counts[d1 - 1]++;
+        if (d2 >= 1 && d2 <= 6) counts[d2 - 1]++;
+    }
+
+    NSMutableString *text = [NSMutableString stringWithFormat:@"本场共 %lu 局  出现次数：",
+                             (unsigned long)rounds.count];
+    for (int i = 0; i < 6; i++) {
+        [text appendFormat:@"%@%ld  ", kACBetNames[i], (long)counts[i]];
+    }
+
+    if (!self.statsHeaderLabel) {
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectZero];
+        lbl.numberOfLines = 0;
+        lbl.font = [UIFont systemFontOfSize:10];
+        lbl.textColor = [UIColor systemYellowColor];
+        lbl.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.06];
+        self.statsHeaderLabel = lbl;
+    }
+    self.statsHeaderLabel.text = text;
+    CGFloat w = self.mainTableView.bounds.size.width;
+    CGSize fit = [self.statsHeaderLabel sizeThatFits:CGSizeMake(w - 8, CGFLOAT_MAX)];
+    self.statsHeaderLabel.frame = CGRectMake(0, 0, w, fit.height + 6);
+    return self.statsHeaderLabel;
 }
 
 #pragma mark - 表格
@@ -755,6 +848,47 @@ static NSString *ACCsvField(NSString *value) {
     }
 
     NSString *fileName = [NSString stringWithFormat:@"room_%@_%.0f.csv", sess[@"room"], [[NSDate date] timeIntervalSince1970]];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
+    [csv writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [self presentShareForFile:path sourceRect:CGRectMake(self.panelView.bounds.size.width - 125, 4, 65, 28)];
+}
+
+- (void)exportAllSessionsCSV {
+    if (self.allSessions.count == 0) {
+        [self addLog:@"[CSV]" detail:@"暂无任何场次记录"];
+        return;
+    }
+    NSMutableString *csv = [NSMutableString stringWithString:
+        @"\ufeff场次rsn,房间号,开赛时间,局时间,局号,虎总押,芦总押,狮总押,蟹总押,鱼总押,虾总押,开奖1,开奖2,庄家盈亏,理论盈亏,账目校验\n"];
+    NSInteger rowCount = 0;
+    for (NSDictionary *sess in self.allSessions) {
+        NSArray *rounds = [sess[@"rounds"] isKindOfClass:[NSArray class]] ? sess[@"rounds"] : @[];
+        for (NSDictionary *r in [rounds reverseObjectEnumerator]) {
+            NSArray *bets = [r[@"bets"] isKindOfClass:[NSArray class]] ? r[@"bets"] : @[@0, @0, @0, @0, @0, @0];
+            NSMutableString *line = [NSMutableString string];
+            [line appendFormat:@"%@,%@,%@,%@,%@",
+             ACCsvField(sess[@"rsn"]), ACCsvField(sess[@"room"]),
+             ACCsvField(sess[@"startTime"]), ACCsvField(r[@"time"]), ACCsvField(r[@"round"])];
+            for (int i = 0; i < 6; i++) {
+                double v = i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
+                [line appendFormat:@",%.0f", v];
+            }
+            [line appendFormat:@",%@,%@,%@,%.0f,%@",
+             ACDiceName([r[@"d1"] integerValue]),
+             ACDiceName([r[@"d2"] integerValue]),
+             ACCsvField(r[@"profit"]),
+             [r[@"expect"] doubleValue],
+             ACCsvField(r[@"verify"])];
+            [csv appendFormat:@"%@\n", line];
+            rowCount++;
+        }
+    }
+    if (rowCount == 0) {
+        [self addLog:@"[CSV]" detail:@"所有场次均无开奖记录"];
+        return;
+    }
+
+    NSString *fileName = [NSString stringWithFormat:@"all_sessions_%.0f.csv", [[NSDate date] timeIntervalSince1970]];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
     [csv writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [self presentShareForFile:path sourceRect:CGRectMake(self.panelView.bounds.size.width - 125, 4, 65, 28)];
