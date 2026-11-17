@@ -659,7 +659,7 @@ static NSString *ACCsvField(NSString *value) {
     }
 
     if (!self.statsHeaderLabel) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectZero];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 0)];
         lbl.numberOfLines = 0;
         lbl.font = [UIFont systemFontOfSize:10];
         lbl.textColor = [UIColor systemYellowColor];
