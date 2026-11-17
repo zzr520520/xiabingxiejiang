@@ -4,9 +4,9 @@
 #include <string.h>
 #include <math.h>
 
-#pragma mark - 日志窗口
-
 static NSString * const kACBetNames[6] = {@"虎", @"芦", @"狮", @"蟹", @"鱼", @"虾"};
+
+#pragma mark - JSON 工具
 
 static double ACNumberValue(id v) {
     if ([v isKindOfClass:[NSNumber class]]) return [v doubleValue];
@@ -32,6 +32,12 @@ static id ACFindDeep(id obj, NSString *key, int depth) {
     return nil;
 }
 
+static NSString *ACStringValue(id v) {
+    if ([v isKindOfClass:[NSString class]]) return v;
+    if ([v isKindOfClass:[NSNumber class]]) return [NSString stringWithFormat:@"%@", v];
+    return nil;
+}
+
 static NSDictionary *ACJSONObjectFromString(NSString *str) {
     NSString *trim = [str stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trim.length < 2) return nil;
@@ -49,7 +55,6 @@ static NSArray<NSNumber *> *ACBetTotalsFromJSON(NSDictionary *json) {
     NSDictionary *betDict = bet;
     double totals[6] = {0};
 
-    // 优先取 bet["1"] 这类完整六门快照，避免把多个外层分组重复累加
     id primary = betDict[@"1"];
     if ([primary isKindOfClass:[NSDictionary class]]) {
         BOOL complete = YES;
@@ -103,31 +108,34 @@ static NSString *ACCsvField(NSString *value) {
     return value;
 }
 
+#pragma mark - 面板
+
 @interface DebugFloatWindow : NSObject <UITableViewDelegate, UITableViewDataSource, UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIWindow *floatWindow;
 @property (nonatomic, strong) UIButton *floatBtn;
 @property (nonatomic, strong) UIView *panelView;
-@property (nonatomic, strong) UITableView *logTableView;
-@property (nonatomic, strong) NSMutableArray<NSDictionary *> *logDataSource;
-@property (nonatomic, strong) NSMutableArray<NSDictionary *> *roundRecords;
-@property (nonatomic, strong) UILabel *summaryLabel;
-@property (nonatomic, strong) UILabel *resultLabel;
-@property (nonatomic, strong) UILabel *statsLabel;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *statsDict;
+@property (nonatomic, strong) UISegmentedControl *tabControl;
+@property (nonatomic, strong) UITableView *mainTableView;
+@property (nonatomic, strong) UIView *analyticsView;
+@property (nonatomic, strong) UITextView *analyticsTextView;
+@property (nonatomic, strong) UILabel *headerInfoLabel;
+@property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *allSessions;
+@property (nonatomic, strong) NSMutableDictionary *activeSession;
 @property (nonatomic, strong) NSArray<NSNumber *> *currentBets;
+@property (nonatomic, assign) NSInteger currentTabIndex;
 + (instancetype)sharedInstance;
-- (void)addLog:(NSString *)title detail:(NSString *)detail;
 - (void)ingestWSMessage:(NSString *)str direction:(NSString *)direction;
-- (void)loadRecords;
-- (void)saveRecords;
-- (void)refreshSummaryLabels;
-- (void)refreshStatsLabel;
-- (void)exportCSV;
-- (void)presentShareForFile:(NSString *)path sourceRect:(CGRect)rect;
-- (NSString *)recordsDirectory;
-- (NSString *)timestampString;
+- (void)addLog:(NSString *)title detail:(NSString *)detail;
+- (void)refreshAllViews;
+- (void)startOrSwitchSessionWithRsn:(NSString *)rsn room:(NSString *)room;
 - (BOOL)handleJSONMessage:(NSDictionary *)json;
 - (void)recordStepJSON:(NSDictionary *)json lottery:(NSArray *)lottery;
+- (void)updateAnalyticsReport;
+- (void)exportCurrentSessionCSV;
+- (void)presentShareForFile:(NSString *)path sourceRect:(CGRect)rect;
+- (NSString *)dataDirectory;
+- (void)saveSessions;
+- (void)loadSessions;
 @end
 
 @implementation DebugFloatWindow
@@ -144,11 +152,10 @@ static NSString *ACCsvField(NSString *value) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        self.currentBets = @[@0, @0, @0, @0, @0, @0];
-        self.statsDict = [@{
-            @"虎": @0, @"芦": @0, @"狮": @0, @"蟹": @0, @"鱼": @0, @"虾": @0
-        } mutableCopy];
-        [self loadRecords];
+        _allSessions = [NSMutableArray array];
+        _currentBets = @[@0, @0, @0, @0, @0, @0];
+        _currentTabIndex = 0;
+        [self loadSessions];
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(setupUI)
                                                      name:UIApplicationDidBecomeActiveNotification
@@ -160,19 +167,55 @@ static NSString *ACCsvField(NSString *value) {
     return self;
 }
 
-- (NSMutableArray<NSDictionary *> *)logDataSource {
-    if (!_logDataSource) {
-        _logDataSource = [NSMutableArray array];
-    }
-    return _logDataSource;
+#pragma mark - 会话模型
+
+- (NSMutableDictionary *)createSessionWithKey:(NSString *)key room:(NSString *)room {
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"MM-dd HH:mm";
+    return [@{
+        @"rsn": key,
+        @"room": room.length ? room : @"未知房间",
+        @"startTime": [fmt stringFromDate:[NSDate date]] ?: @"",
+        @"totalProfit": @0,
+        @"rounds": [NSMutableArray array]
+    } mutableCopy];
 }
 
-- (NSMutableArray<NSDictionary *> *)roundRecords {
-    if (!_roundRecords) {
-        _roundRecords = [NSMutableArray array];
+- (NSMutableDictionary *)ensureActiveSession {
+    if (self.activeSession) return self.activeSession;
+    if (self.allSessions.count > 0) {
+        self.activeSession = self.allSessions.firstObject;
+        return self.activeSession;
     }
-    return _roundRecords;
+    NSMutableDictionary *sess = [self createSessionWithKey:@"DEFAULT" room:@"默认记录"];
+    [self.allSessions insertObject:sess atIndex:0];
+    self.activeSession = sess;
+    [self saveSessions];
+    return sess;
 }
+
+- (void)startOrSwitchSessionWithRsn:(NSString *)rsn room:(NSString *)room {
+    NSString *key = rsn.length ? rsn : (room.length ? [NSString stringWithFormat:@"room_%@", room] : @"DEFAULT");
+    for (NSMutableDictionary *sess in self.allSessions) {
+        if ([sess[@"rsn"] isEqualToString:key]) {
+            if (sess != self.activeSession) {
+                self.activeSession = sess;
+                [self addLog:@"[场次]" detail:[NSString stringWithFormat:@"切换到 房号:%@", sess[@"room"]]];
+            }
+            [self refreshAllViews];
+            return;
+        }
+    }
+    NSMutableDictionary *sess = [self createSessionWithKey:key room:room];
+    [self.allSessions insertObject:sess atIndex:0];
+    self.activeSession = sess;
+    self.currentBets = @[@0, @0, @0, @0, @0, @0];
+    [self saveSessions];
+    [self addLog:@"[场次]" detail:[NSString stringWithFormat:@"新建 房号:%@", sess[@"room"]]];
+    [self refreshAllViews];
+}
+
+#pragma mark - UI
 
 - (UIWindow *)getKeyWindow {
     if (@available(iOS 13.0, *)) {
@@ -203,10 +246,8 @@ static NSString *ACCsvField(NSString *value) {
                 self.floatWindow = [[UIWindow alloc] initWithWindowScene:keyWindow.windowScene];
             }
         }
-        if (!self.floatWindow) {
-            self.floatWindow = [[UIWindow alloc] initWithFrame:CGRectMake(20, 100, 46, 46)];
-        }
-        self.floatWindow.frame = CGRectMake(20, 100, 46, 46);
+        if (!self.floatWindow) self.floatWindow = [[UIWindow alloc] initWithFrame:CGRectMake(20, 80, 50, 50)];
+        self.floatWindow.frame = CGRectMake(20, 80, 50, 50);
         self.floatWindow.windowLevel = UIWindowLevelAlert + 1000;
         self.floatWindow.backgroundColor = [UIColor clearColor];
         UIViewController *hostVC = [[UIViewController alloc] init];
@@ -216,176 +257,173 @@ static NSString *ACCsvField(NSString *value) {
 
         self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
         self.floatBtn.frame = self.floatWindow.bounds;
-        self.floatBtn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.85];
-        self.floatBtn.layer.cornerRadius = 23;
-        [self.floatBtn setTitle:@"日志" forState:UIControlStateNormal];
-        self.floatBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        self.floatBtn.backgroundColor = [[UIColor systemIndigoColor] colorWithAlphaComponent:0.9];
+        self.floatBtn.layer.cornerRadius = 25;
+        [self.floatBtn setTitle:@"数据" forState:UIControlStateNormal];
+        self.floatBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         [self.floatBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self.floatBtn addGestureRecognizer:pan];
+        UIPanGestureRecognizer *btnPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleBtnPan:)];
+        [self.floatBtn addGestureRecognizer:btnPan];
         [hostVC.view addSubview:self.floatBtn];
 
-        CGFloat panelW = MIN(keyWindow.bounds.size.width - 40, 420);
-        CGFloat panelH = MIN(keyWindow.bounds.size.height - 80, 280);
-        self.panelView = [[UIView alloc] initWithFrame:CGRectMake(20, 60, panelW, panelH)];
-        self.panelView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.88];
-        self.panelView.layer.cornerRadius = 10;
+        CGFloat panelW = MIN(keyWindow.bounds.size.width - 30, 500);
+        CGFloat panelH = MIN(keyWindow.bounds.size.height - 50, 340);
+        self.panelView = [[UIView alloc] initWithFrame:CGRectMake(15, 30, panelW, panelH)];
+        self.panelView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.93];
+        self.panelView.layer.cornerRadius = 12;
+        self.panelView.layer.borderWidth = 1;
+        self.panelView.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
         self.panelView.hidden = YES;
         UIPanGestureRecognizer *panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanelPan:)];
         panelPan.delegate = self;
         [self.panelView addGestureRecognizer:panelPan];
 
+        self.headerInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, panelW - 140, 24)];
+        self.headerInfoLabel.textColor = [UIColor systemYellowColor];
+        self.headerInfoLabel.font = [UIFont boldSystemFontOfSize:11];
+        [self.panelView addSubview:self.headerInfoLabel];
+
         UIButton *exportBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        exportBtn.frame = CGRectMake(10, 5, 80, 30);
-        [exportBtn setTitle:@"导出日志" forState:UIControlStateNormal];
-        [exportBtn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
-        exportBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        [exportBtn addTarget:self action:@selector(exportLogs) forControlEvents:UIControlEventTouchUpInside];
+        exportBtn.frame = CGRectMake(panelW - 125, 4, 65, 28);
+        [exportBtn setTitle:@"导出本场" forState:UIControlStateNormal];
+        [exportBtn setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
+        exportBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        [exportBtn addTarget:self action:@selector(exportCurrentSessionCSV) forControlEvents:UIControlEventTouchUpInside];
         [self.panelView addSubview:exportBtn];
 
-        UIButton *csvBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        csvBtn.frame = CGRectMake(94, 5, 60, 30);
-        [csvBtn setTitle:@"CSV" forState:UIControlStateNormal];
-        [csvBtn setTitleColor:[UIColor systemCyanColor] forState:UIControlStateNormal];
-        csvBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        [csvBtn addTarget:self action:@selector(exportCSV) forControlEvents:UIControlEventTouchUpInside];
-        [self.panelView addSubview:csvBtn];
+        UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeBtn.frame = CGRectMake(panelW - 55, 4, 45, 28);
+        [closeBtn setTitle:@"收起" forState:UIControlStateNormal];
+        [closeBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
+        closeBtn.titleLabel.font = [UIFont systemFontOfSize:11];
+        [closeBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
+        [self.panelView addSubview:closeBtn];
 
-        UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        clearBtn.frame = CGRectMake(158, 5, 50, 30);
-        [clearBtn setTitle:@"清空" forState:UIControlStateNormal];
-        [clearBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
-        clearBtn.titleLabel.font = [UIFont systemFontOfSize:12];
-        [clearBtn addTarget:self action:@selector(clearLogs) forControlEvents:UIControlEventTouchUpInside];
-        [self.panelView addSubview:clearBtn];
+        self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"本场局明细", @"房间场次", @"押分与命中率"]];
+        self.tabControl.frame = CGRectMake(10, 34, panelW - 20, 28);
+        self.tabControl.selectedSegmentIndex = 0;
+        self.tabControl.backgroundColor = [[UIColor darkGrayColor] colorWithAlphaComponent:0.5];
+        [self.tabControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor],
+                                                  NSFontAttributeName: [UIFont boldSystemFontOfSize:11]}
+                                       forState:UIControlStateNormal];
+        [self.tabControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor blackColor],
+                                                  NSFontAttributeName: [UIFont boldSystemFontOfSize:11]}
+                                       forState:UIControlStateSelected];
+        [self.tabControl addTarget:self action:@selector(onTabChanged:) forControlEvents:UIControlEventValueChanged];
+        [self.panelView addSubview:self.tabControl];
 
-        self.summaryLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 38, panelW - 20, 18)];
-        self.summaryLabel.font = [UIFont systemFontOfSize:11];
-        self.summaryLabel.textColor = [UIColor systemYellowColor];
-        self.summaryLabel.text = @"押分：等待 dobet/notice ...";
-        [self.panelView addSubview:self.summaryLabel];
+        CGRect content = CGRectMake(10, 68, panelW - 20, panelH - 74);
+        self.mainTableView = [[UITableView alloc] initWithFrame:content style:UITableViewStylePlain];
+        self.mainTableView.backgroundColor = [UIColor clearColor];
+        self.mainTableView.separatorColor = [[UIColor whiteColor] colorWithAlphaComponent:0.15];
+        self.mainTableView.delegate = self;
+        self.mainTableView.dataSource = self;
+        [self.panelView addSubview:self.mainTableView];
 
-        self.resultLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 56, panelW - 20, 18)];
-        self.resultLabel.font = [UIFont boldSystemFontOfSize:11];
-        self.resultLabel.textColor = [UIColor systemGreenColor];
-        self.resultLabel.text = @"开奖：等待 step ...";
-        [self.panelView addSubview:self.resultLabel];
-
-        self.statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 74, panelW - 20, 16)];
-        self.statsLabel.font = [UIFont systemFontOfSize:10];
-        self.statsLabel.textColor = [UIColor lightGrayColor];
-        [self.panelView addSubview:self.statsLabel];
-
-        self.logTableView = [[UITableView alloc] initWithFrame:CGRectMake(10, 94, panelW - 20, MAX(60, panelH - 99))
-                                                        style:UITableViewStylePlain];
-        self.logTableView.backgroundColor = [UIColor clearColor];
-        self.logTableView.delegate = self;
-        self.logTableView.dataSource = self;
-        [self.panelView addSubview:self.logTableView];
+        self.analyticsView = [[UIView alloc] initWithFrame:content];
+        self.analyticsView.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.05];
+        self.analyticsView.layer.cornerRadius = 8;
+        self.analyticsView.hidden = YES;
+        self.analyticsTextView = [[UITextView alloc] initWithFrame:CGRectMake(6, 4, content.size.width - 12, content.size.height - 8)];
+        self.analyticsTextView.backgroundColor = [UIColor clearColor];
+        self.analyticsTextView.textColor = [UIColor whiteColor];
+        self.analyticsTextView.font = [UIFont systemFontOfSize:11];
+        self.analyticsTextView.editable = NO;
+        [self.analyticsView addSubview:self.analyticsTextView];
+        [self.panelView addSubview:self.analyticsView];
 
         [keyWindow addSubview:self.panelView];
-        [self refreshSummaryLabels];
-        [self refreshStatsLabel];
-        [self addLog:@"[启动]" detail:@"调试面板已挂载，HTTP/WebSocket 监听就绪"];
+        [self refreshAllViews];
+        [self addLog:@"[启动]" detail:@"调试面板已挂载"];
     });
 }
 
-- (void)exportLogs {
-    if (self.logDataSource.count == 0) return;
-    NSMutableString *fullText = [NSMutableString string];
-    for (NSDictionary *item in [self.logDataSource reverseObjectEnumerator]) {
-        [fullText appendFormat:@"[%@] %@\n%@\n----------------------------------------\n",
-         item[@"time"], item[@"title"], item[@"detail"]];
-    }
-    [UIPasteboard generalPasteboard].string = fullText;
-
-    NSString *fileName = [NSString stringWithFormat:@"debug_log_%.0f.txt", [[NSDate date] timeIntervalSince1970]];
-    NSString *filePath = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
-    [fullText writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [self presentShareForFile:filePath sourceRect:CGRectMake(10, 5, 80, 30)];
+- (void)onTabChanged:(UISegmentedControl *)sender {
+    self.currentTabIndex = sender.selectedSegmentIndex;
+    [self refreshAllViews];
 }
 
-- (void)presentShareForFile:(NSString *)path sourceRect:(CGRect)rect {
-    if (path.length == 0) return;
-    UIViewController *topVC = [self getKeyWindow].rootViewController;
-    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
-    if (!topVC) return;
-
-    UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
-                                                                             applicationActivities:nil];
-    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
-        activityVC.popoverPresentationController.sourceView = self.panelView;
-        activityVC.popoverPresentationController.sourceRect = rect;
+- (void)refreshAllViews {
+    if (!self.mainTableView) return;
+    NSMutableDictionary *sess = [self ensureActiveSession];
+    NSArray *rounds = [sess[@"rounds"] isKindOfClass:[NSArray class]] ? sess[@"rounds"] : @[];
+    if (self.headerInfoLabel) {
+        self.headerInfoLabel.text = [NSString stringWithFormat:@"房号:%@ | 已开%lu局 | 庄总盈:%@",
+                                     sess[@"room"] ?: @"-", (unsigned long)rounds.count, sess[@"totalProfit"] ?: @0];
     }
-    [topVC presentViewController:activityVC animated:YES completion:nil];
+    if (self.currentTabIndex == 2) {
+        self.mainTableView.hidden = YES;
+        self.analyticsView.hidden = NO;
+        [self updateAnalyticsReport];
+    } else {
+        self.mainTableView.hidden = NO;
+        self.analyticsView.hidden = YES;
+        [self.mainTableView reloadData];
+    }
 }
 
-#pragma mark - WebSocket 解析
+- (void)togglePanel {
+    if (!self.panelView) [self setupUI];
+    self.panelView.hidden = !self.panelView.hidden;
+    if (!self.panelView.hidden) [self refreshAllViews];
+}
+
+#pragma mark - 消息解析
 
 - (void)ingestWSMessage:(NSString *)str direction:(NSString *)direction {
     if (![str isKindOfClass:[NSString class]] || str.length == 0) return;
     NSString *trim = [str stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trim.length == 0) return;
-
     NSString *lower = trim.lowercaseString;
     if ([lower isEqualToString:@"ping"] || [lower isEqualToString:@"pong"] ||
         [lower isEqualToString:@"2"] || [lower isEqualToString:@"3"]) {
         return;
     }
-
     NSDictionary *json = ACJSONObjectFromString(trim);
-    if (json) {
-        id cmd = ACFindDeep(json, @"act", 0) ?: ACFindDeep(json, @"c", 0) ?: ACFindDeep(json, @"cmd", 0);
-        if ([cmd isKindOfClass:[NSString class]]) {
-            NSString *cmdLower = [(NSString *)cmd lowercaseString];
-            if ([cmdLower isEqualToString:@"ping"] || [cmdLower isEqualToString:@"pong"]) return;
-        }
-    }
-
     dispatch_async(dispatch_get_main_queue(), ^{
-        BOOL handled = NO;
-        if (json) handled = [self handleJSONMessage:json];
-        if (handled) return; // 下注通知 / 开奖已转成一行摘要，不重复刷原始 JSON
-        NSString *detail = trim.length > 3000 ? [trim substringToIndex:3000] : trim;
-        [self addLog:direction detail:detail];
+        BOOL handled = json ? [self handleJSONMessage:json] : NO;
+        if (!handled) {
+            NSString *detail = trim.length > 3000 ? [trim substringToIndex:3000] : trim;
+            [self addLog:direction detail:detail];
+        }
     });
 }
 
 - (BOOL)handleJSONMessage:(NSDictionary *)json {
-    NSDictionary *dataDict = json;
+    NSDictionary *data = json;
     id dataObj = json[@"data"];
-    if ([dataObj isKindOfClass:[NSDictionary class]]) dataDict = dataObj;
-
-    NSArray<NSNumber *> *bets = ACBetTotalsFromJSON(json);
-    if (bets) {
-        self.currentBets = bets;
-        [self refreshSummaryLabels];
-    }
+    if ([dataObj isKindOfClass:[NSDictionary class]]) data = dataObj;
 
     NSString *act = nil;
     for (NSString *key in @[@"act", @"c", @"cmd", @"type", @"action", @"method"]) {
-        id v = dataDict[key];
-        if (![v isKindOfClass:[NSString class]]) v = ACFindDeep(json, key, 0);
-        if ([v isKindOfClass:[NSString class]]) {
-            act = [(NSString *)v lowercaseString];
-            break;
-        }
+        NSString *v = ACStringValue(data[key]) ?: ACStringValue(ACFindDeep(json, key, 0));
+        if (v.length) { act = v.lowercaseString; break; }
     }
-    if (act.length == 0) act = @"";
+    if (!act) act = @"";
 
-    if ([act containsString:@"dobet/notice"] || [act containsString:@"dobet"]) {
-        return YES; // 只更新押分快照，不写日志
+    // 进房 / 建房：按 rsn 独立建档
+    if ([act containsString:@"room/create"] || [act containsString:@"yuxia/join"] || [act containsString:@"join"]) {
+        id roomObj = data[@"room"];
+        NSDictionary *room = [roomObj isKindOfClass:[NSDictionary class]] ? roomObj : nil;
+        NSString *rsn = ACStringValue(room[@"rsn"]) ?: ACStringValue(ACFindDeep(json, @"rsn", 0));
+        NSString *num = ACStringValue(room[@"number"]) ?: ACStringValue(ACFindDeep(json, @"number", 0));
+        if (rsn.length || num.length) [self startOrSwitchSessionWithRsn:rsn room:num];
+        return YES;
     }
 
-    id statusObj = dataDict[@"status"] ?: ACFindDeep(json, @"status", 0);
+    // 押分快照
+    NSArray<NSNumber *> *bets = ACBetTotalsFromJSON(json);
+    if (bets) self.currentBets = bets;
+    if ([act containsString:@"dobet/notice"] || [act containsString:@"dobet"]) return YES;
+
+    id statusObj = data[@"status"] ?: ACFindDeep(json, @"status", 0);
     NSInteger status = [statusObj respondsToSelector:@selector(integerValue)] ? [statusObj integerValue] : -1;
+    id lottery = data[@"lottery"] ?: ACFindDeep(json, @"lottery", 0);
 
-    id lottery = dataDict[@"lottery"] ?: ACFindDeep(json, @"lottery", 0);
-    BOOL isStep = [act containsString:@"step"] || ACFindDeep(json, @"round_result", 0) != nil;
-    if (isStep) {
+    if ([act containsString:@"step"]) {
         if (status == 3) {
             self.currentBets = @[@0, @0, @0, @0, @0, @0];
-            [self refreshSummaryLabels];
+            return YES;
         }
         if ([lottery isKindOfClass:[NSArray class]] && ((NSArray *)lottery).count >= 2) {
             [self recordStepJSON:json lottery:lottery];
@@ -396,232 +434,339 @@ static NSString *ACCsvField(NSString *value) {
 }
 
 - (void)recordStepJSON:(NSDictionary *)json lottery:(NSArray *)lottery {
-    NSString *round = nil;
     id rr = ACFindDeep(json, @"round_result", 0);
-    if ([rr isKindOfClass:[NSDictionary class]]) {
-        id roomObj = ACFindDeep(rr, @"room", 0);
+    NSDictionary *roundResult = [rr isKindOfClass:[NSDictionary class]] ? rr : nil;
+
+    // 开奖包本身也带房号，先确保场次正确
+    if (roundResult) {
+        id roomObj = ACFindDeep(roundResult, @"room", 0);
         if ([roomObj isKindOfClass:[NSDictionary class]]) {
-            id cg = ACFindDeep(roomObj, @"cgidx", 0);
-            if ([cg isKindOfClass:[NSNumber class]] || [cg isKindOfClass:[NSString class]]) {
-                round = [NSString stringWithFormat:@"%@", cg];
-            }
+            NSString *rsn = ACStringValue(((NSDictionary *)roomObj)[@"rsn"]);
+            NSString *num = ACStringValue(((NSDictionary *)roomObj)[@"number"]);
+            if (rsn.length || num.length) [self startOrSwitchSessionWithRsn:rsn room:num];
+        }
+    }
+
+    NSMutableDictionary *sess = [self ensureActiveSession];
+    NSMutableArray *rounds = sess[@"rounds"];
+    if (![rounds isKindOfClass:[NSMutableArray class]]) {
+        rounds = [NSMutableArray array];
+        sess[@"rounds"] = rounds;
+    }
+
+    NSString *round = nil;
+    if (roundResult) {
+        id roomObj = ACFindDeep(roundResult, @"room", 0);
+        if ([roomObj isKindOfClass:[NSDictionary class]]) {
+            round = ACStringValue(((NSDictionary *)roomObj)[@"cgidx"]);
         }
     }
     if (round.length == 0) {
         for (NSString *k in @[@"cgidx", @"round", @"issue", @"qihao", @"expect", @"period"]) {
-            id v = ACFindDeep(json, k, 0);
-            if ([v isKindOfClass:[NSNumber class]] || [v isKindOfClass:[NSString class]]) {
-                round = [NSString stringWithFormat:@"%@", v];
-                break;
-            }
+            NSString *v = ACStringValue(ACFindDeep(json, k, 0));
+            if (v.length) { round = v; break; }
         }
     }
-    if (round.length == 0) {
-        round = [NSString stringWithFormat:@"%lu", (unsigned long)(self.roundRecords.count + 1)];
-    }
+    if (round.length == 0) round = [NSString stringWithFormat:@"%lu", (unsigned long)(rounds.count + 1)];
 
-    NSDictionary *last = self.roundRecords.lastObject;
-    if (last && [last[@"round"] isEqualToString:round]) return;
+    NSDictionary *newest = rounds.firstObject;
+    if (newest && [newest[@"round"] isEqualToString:round]) return;
 
     NSInteger d1 = [lottery[0] integerValue];
     NSInteger d2 = [lottery[1] integerValue];
-
-    NSString *room = @"";
-    if ([rr isKindOfClass:[NSDictionary class]]) {
-        id roomObj = ACFindDeep(rr, @"room", 0);
-        if ([roomObj isKindOfClass:[NSDictionary class]]) {
-            id num = ACFindDeep(roomObj, @"number", 0);
-            if ([num isKindOfClass:[NSNumber class]] || [num isKindOfClass:[NSString class]]) {
-                room = [NSString stringWithFormat:@"%@", num];
-            }
-        }
-    }
+    NSString *n1 = ACDiceName(d1), *n2 = ACDiceName(d2);
 
     id p = nil;
-    if ([rr isKindOfClass:[NSDictionary class]]) {
-        id banker = ACFindDeep(rr, @"banker", 0);
-        if ([banker isKindOfClass:[NSDictionary class]]) {
-            p = ACFindDeep(banker, @"profit", 0);
-        }
-        if (!p) p = ACFindDeep(rr, @"profit", 0) ?: ACFindDeep(rr, @"win", 0);
+    if (roundResult) {
+        id banker = ACFindDeep(roundResult, @"banker", 0);
+        if ([banker isKindOfClass:[NSDictionary class]]) p = ACFindDeep(banker, @"profit", 0);
+        if (!p) p = ACFindDeep(roundResult, @"profit", 0) ?: ACFindDeep(roundResult, @"win", 0);
     } else if ([rr isKindOfClass:[NSNumber class]]) {
         p = rr;
     }
     if (!p) p = ACFindDeep(json, @"profit", 0);
-    NSString *profit = ([p isKindOfClass:[NSNumber class]] || [p isKindOfClass:[NSString class]])
-        ? [NSString stringWithFormat:@"%@", p] : @"";
+    NSString *profit = ACStringValue(p) ?: @"";
 
     NSArray *bets = [self.currentBets copy] ?: @[@0, @0, @0, @0, @0, @0];
     double totalBets = 0;
-    for (int i = 0; i < 6; i++) {
-        totalBets += i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
-    }
-    double betOn1 = (d1 >= 1 && d1 <= 6) ? [bets[d1 - 1] doubleValue] : 0;
-    double betOn2 = (d2 >= 1 && d2 <= 6) ? [bets[d2 - 1] doubleValue] : 0;
-    double returned = (d1 == d2) ? betOn1 * 3.0 : betOn1 * 2.0 + betOn2 * 2.0;
-    double expectedProfit = totalBets - returned;
+    for (int i = 0; i < 6; i++) totalBets += [bets[i] doubleValue];
+    double bet1 = (d1 >= 1 && d1 <= 6) ? [bets[d1 - 1] doubleValue] : 0;
+    double bet2 = (d2 >= 1 && d2 <= 6) ? [bets[d2 - 1] doubleValue] : 0;
+    double returned = (d1 == d2) ? bet1 * 3.0 : bet1 * 2.0 + bet2 * 2.0;
+    double expected = totalBets - returned;
 
     NSString *verify = @"";
-    if (profit.length > 0) {
-        double actual = [profit doubleValue];
-        double diff = actual - expectedProfit;
+    if (profit.length) {
+        double diff = [profit doubleValue] - expected;
         verify = fabs(diff) < 0.5 ? @"✅一致" : [NSString stringWithFormat:@"⚠️差%.0f", diff];
     }
 
-    NSDictionary *record = @{
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    NSDictionary *item = @{
+        @"time": [fmt stringFromDate:[NSDate date]] ?: @"",
         @"round": round,
-        @"room": room,
         @"bets": bets,
         @"d1": @(d1),
         @"d2": @(d2),
         @"profit": profit,
-        @"expect": @(expectedProfit),
-        @"verify": verify,
-        @"time": [self timestampString]
+        @"expect": @(expected),
+        @"verify": verify
     };
-    [self.roundRecords addObject:record];
-    if (self.roundRecords.count > 2000) [self.roundRecords removeObjectAtIndex:0];
+    [rounds insertObject:item atIndex:0];
+    sess[@"totalProfit"] = @([sess[@"totalProfit"] doubleValue] + [profit doubleValue]);
+    [self saveSessions];
+    [self refreshAllViews];
 
-    NSString *n1 = ACDiceName(d1), *n2 = ACDiceName(d2);
-    for (NSString *name in @[n1, n2]) {
-        if (self.statsDict[name]) {
-            self.statsDict[name] = @([self.statsDict[name] integerValue] + 1);
+    [self addLog:@"[开奖]" detail:[NSString stringWithFormat:@"房%@ 第%@局 %@+%@ 盈%@ 理论%.0f %@",
+                                  sess[@"room"], round, n1, n2, profit.length ? profit : @"-", expected, verify]];
+}
+
+#pragma mark - 命中率分析
+
+- (void)updateAnalyticsReport {
+    NSMutableDictionary *sess = [self ensureActiveSession];
+    NSArray *rounds = [sess[@"rounds"] isKindOfClass:[NSArray class]] ? sess[@"rounds"] : @[];
+    NSInteger total = rounds.count;
+    if (total == 0) {
+        self.analyticsTextView.text = @"当前房间暂无开奖数据。\n完成一局开奖后这里会自动统计。";
+        return;
+    }
+
+    NSArray *keys = @[@"b1", @"b2", @"b3", @"b4", @"b5", @"b6"];
+    NSInteger hits[6] = {0};
+    NSInteger diceCounts[6] = {0};
+    double betSums[6] = {0};
+    NSInteger heavyHit = 0, heavyValid = 0, sameCount = 0;
+
+    for (NSDictionary *r in rounds) {
+        NSInteger d1 = [r[@"d1"] integerValue];
+        NSInteger d2 = [r[@"d2"] integerValue];
+        if (d1 == d2) sameCount++;
+        if (d1 >= 1 && d1 <= 6) { hits[d1 - 1]++; diceCounts[d1 - 1]++; }
+        if (d2 >= 1 && d2 <= 6) { diceCounts[d2 - 1]++; if (d2 != d1) hits[d2 - 1]++; }
+
+        NSArray *bets = [r[@"bets"] isKindOfClass:[NSArray class]] ? r[@"bets"] : @[];
+        double maxBet = 0;
+        NSInteger maxIdx = -1;
+        for (int i = 0; i < 6; i++) {
+            double v = i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
+            betSums[i] += v;
+            if (v > maxBet) { maxBet = v; maxIdx = i; }
+        }
+        if (maxBet > 0 && maxIdx >= 0) {
+            heavyValid++;
+            if ((d1 - 1) == maxIdx || (d2 - 1) == maxIdx) heavyHit++;
         }
     }
-    [self saveRecords];
 
-    self.resultLabel.text = [NSString stringWithFormat:@"开奖：%@ + %@   盈亏 %@   第 %@ 局  %@",
-                             n1, n2, profit.length ? profit : @"-", round, verify];
-    [self refreshStatsLabel];
-    [self addLog:@"[开奖]" detail:[NSString stringWithFormat:@"第 %@ 局  开 %@ + %@  盈亏 %@  理论 %.0f  %@\n押分 虎:%.0f 芦:%.0f 狮:%.0f 蟹:%.0f 鱼:%.0f 虾:%.0f",
-                                  round, n1, n2, profit.length ? profit : @"-", expectedProfit, verify,
-                                  [bets[0] doubleValue], [bets[1] doubleValue], [bets[2] doubleValue],
-                                  [bets[3] doubleValue], [bets[4] doubleValue], [bets[5] doubleValue]]];
-}
-
-- (void)refreshSummaryLabels {
-    NSArray *bets = self.currentBets ?: @[@0, @0, @0, @0, @0, @0];
-    NSMutableString *text = [NSMutableString stringWithString:@"押分 "];
-    for (int i = 0; i < 6; i++) {
-        double v = i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
-        [text appendFormat:@"%@:%.0f  ", kACBetNames[i], v];
+    NSMutableString *report = [NSMutableString string];
+    [report appendFormat:@"房间 %@  共 %ld 局\n", sess[@"room"], (long)total];
+    [report appendFormat:@"庄累计盈亏：%@   同点局：%ld\n", sess[@"totalProfit"], (long)sameCount];
+    if (heavyValid > 0) {
+        [report appendFormat:@"最大押分门命中率：%.1f%% (%ld/%ld)\n",
+         (double)heavyHit / heavyValid * 100.0, (long)heavyHit, (long)heavyValid];
     }
-    self.summaryLabel.text = text;
-}
-
-- (void)refreshStatsLabel {
-    if (!self.statsLabel) return;
-    NSMutableString *text = [NSMutableString stringWithFormat:@"共%lu局  ", (unsigned long)self.roundRecords.count];
+    [report appendString:@"------------------------------\n"];
+    [report appendString:@"门类  押分合计  骰数  局命中  命中率\n"];
     for (int i = 0; i < 6; i++) {
-        [text appendFormat:@"%@:%@  ", kACBetNames[i], self.statsDict[kACBetNames[i]] ?: @0];
+        [report appendFormat:@" %@   %8.0f   %3ld   %3ld   %5.1f%%\n",
+         kACBetNames[i], betSums[i], (long)diceCounts[i], (long)hits[i],
+         (double)hits[i] / total * 100.0];
     }
-    self.statsLabel.text = text;
+    [report appendString:@"------------------------------\n"];
+    [report appendString:@"理论参考：单门至少出现一次 30.6%\n"];
+    [report appendFormat:@"样本量 %ld 局，偏差需上百局才有统计意义。", (long)total];
+    self.analyticsTextView.text = report;
 }
 
-#pragma mark - 记录持久化与 CSV
+#pragma mark - 表格
 
-- (NSString *)recordsDirectory {
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (self.currentTabIndex == 0) {
+        NSArray *rounds = [self ensureActiveSession][@"rounds"];
+        return [rounds isKindOfClass:[NSArray class]] ? rounds.count : 0;
+    }
+    return self.allSessions.count;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return 46.0;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"DataCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"DataCell"];
+        cell.backgroundColor = [UIColor clearColor];
+        cell.selectionStyle = UITableViewCellSelectionStyleGray;
+        cell.textLabel.font = [UIFont boldSystemFontOfSize:11];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:10];
+        cell.detailTextLabel.textColor = [UIColor lightGrayColor];
+    }
+
+    if (self.currentTabIndex == 0) {
+        NSArray *rounds = [self ensureActiveSession][@"rounds"];
+        NSDictionary *r = rounds[indexPath.row];
+        cell.textLabel.textColor = [UIColor systemGreenColor];
+        cell.textLabel.text = [NSString stringWithFormat:@"[%@] 第%@局 [%@+%@] 盈:%@ %@",
+                               r[@"time"], r[@"round"], ACDiceName([r[@"d1"] integerValue]),
+                               ACDiceName([r[@"d2"] integerValue]), r[@"profit"], r[@"verify"]];
+        NSArray *bets = [r[@"bets"] isKindOfClass:[NSArray class]] ? r[@"bets"] : @[];
+        NSMutableString *detail = [NSMutableString stringWithString:@"押分 "];
+        for (int i = 0; i < 6 && i < (NSInteger)bets.count; i++) {
+            [detail appendFormat:@"%@:%.0f ", kACBetNames[i], [bets[i] doubleValue]];
+        }
+        cell.detailTextLabel.text = detail;
+    } else {
+        NSMutableDictionary *sess = self.allSessions[indexPath.row];
+        BOOL isCurrent = (sess == self.activeSession);
+        NSArray *rounds = [sess[@"rounds"] isKindOfClass:[NSArray class]] ? sess[@"rounds"] : @[];
+        cell.textLabel.textColor = isCurrent ? [UIColor systemYellowColor] : [UIColor whiteColor];
+        cell.textLabel.text = [NSString stringWithFormat:@"%@房%@ (%@) %lu局 盈:%@",
+                               isCurrent ? @"👉" : @"", sess[@"room"], sess[@"startTime"],
+                               (unsigned long)rounds.count, sess[@"totalProfit"]];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"rsn:%@  左滑可删除", sess[@"rsn"]];
+    }
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (self.currentTabIndex == 1 && indexPath.row < (NSInteger)self.allSessions.count) {
+        self.activeSession = self.allSessions[indexPath.row];
+        self.currentTabIndex = 0;
+        self.tabControl.selectedSegmentIndex = 0;
+        [self refreshAllViews];
+    }
+}
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    return self.currentTabIndex == 1;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (editingStyle != UITableViewCellEditingStyleDelete || self.currentTabIndex != 1) return;
+    if (indexPath.row >= (NSInteger)self.allSessions.count) return;
+    NSMutableDictionary *target = self.allSessions[indexPath.row];
+    [self.allSessions removeObjectAtIndex:indexPath.row];
+    if (target == self.activeSession) {
+        self.activeSession = self.allSessions.count ? self.allSessions.firstObject : nil;
+    }
+    [self saveSessions];
+    [self refreshAllViews];
+}
+
+#pragma mark - 持久化
+
+- (NSString *)dataDirectory {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *dir = [docs stringByAppendingPathComponent:@"AirChatDebug"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return dir;
 }
 
-- (NSString *)timestampString {
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    return [fmt stringFromDate:[NSDate date]] ?: @"";
-}
-
-- (void)loadRecords {
-    NSString *path = [[self recordsDirectory] stringByAppendingPathComponent:@"rounds.json"];
-    NSData *data = [NSData dataWithContentsOfFile:path];
+- (void)saveSessions {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:self.allSessions options:0 error:nil];
     if (!data) return;
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if (![obj isKindOfClass:[NSArray class]]) return;
-    for (id item in (NSArray *)obj) {
-        if (![item isKindOfClass:[NSDictionary class]]) continue;
-        [self.roundRecords addObject:item];
-        NSString *name1 = ACDiceName([item[@"d1"] integerValue]);
-        NSString *name2 = ACDiceName([item[@"d2"] integerValue]);
-        for (NSString *name in @[name1, name2]) {
-            if (self.statsDict[name]) {
-                self.statsDict[name] = @([self.statsDict[name] integerValue] + 1);
-            }
-        }
-    }
-    [self refreshStatsLabel];
-}
-
-- (void)saveRecords {
-    NSArray *snapshot = [self.roundRecords copy];
-    NSString *path = [[self recordsDirectory] stringByAppendingPathComponent:@"rounds.json"];
+    NSString *path = [[self dataDirectory] stringByAppendingPathComponent:@"sessions.json"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSData *data = [NSJSONSerialization dataWithJSONObject:snapshot options:0 error:nil];
-        if (data) [data writeToFile:path atomically:YES];
+        [data writeToFile:path atomically:YES];
     });
 }
 
-- (void)exportCSV {
-    if (self.roundRecords.count == 0) {
-        [self addLog:@"[CSV]" detail:@"暂无开奖记录"];
+- (void)loadSessions {
+    NSString *path = [[self dataDirectory] stringByAppendingPathComponent:@"sessions.json"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data) {
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+        if ([obj isKindOfClass:[NSArray class]]) {
+            for (id item in (NSArray *)obj) {
+                if (![item isKindOfClass:[NSMutableDictionary class]]) continue;
+                NSMutableDictionary *sess = item;
+                if (![sess[@"rounds"] isKindOfClass:[NSMutableArray class]]) {
+                    sess[@"rounds"] = [NSMutableArray array];
+                }
+                [self.allSessions addObject:sess];
+            }
+        }
+        self.activeSession = self.allSessions.firstObject;
+        return;
+    }
+
+    // 迁移旧版单场记录
+    NSString *legacy = [[self dataDirectory] stringByAppendingPathComponent:@"rounds.json"];
+    NSData *legacyData = [NSData dataWithContentsOfFile:legacy];
+    if (!legacyData) return;
+    id obj = [NSJSONSerialization JSONObjectWithData:legacyData options:NSJSONReadingMutableContainers error:nil];
+    if (![obj isKindOfClass:[NSArray class]] || ((NSArray *)obj).count == 0) return;
+    NSMutableDictionary *sess = [self createSessionWithKey:@"legacy" room:@"默认记录"];
+    NSMutableArray *rounds = [NSMutableArray array];
+    double totalProfit = 0;
+    for (id item in (NSArray *)obj) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        [rounds addObject:item];
+        totalProfit += [item[@"profit"] doubleValue];
+    }
+    sess[@"rounds"] = rounds;
+    sess[@"totalProfit"] = @(totalProfit);
+    [self.allSessions addObject:sess];
+    self.activeSession = sess;
+}
+
+#pragma mark - CSV
+
+- (void)presentShareForFile:(NSString *)path sourceRect:(CGRect)rect {
+    UIViewController *topVC = [self getKeyWindow].rootViewController;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+    if (!topVC) return;
+    UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                                                     applicationActivities:nil];
+    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+        vc.popoverPresentationController.sourceView = self.panelView;
+        vc.popoverPresentationController.sourceRect = rect;
+    }
+    [topVC presentViewController:vc animated:YES completion:nil];
+}
+
+- (void)exportCurrentSessionCSV {
+    NSMutableDictionary *sess = [self ensureActiveSession];
+    NSArray *rounds = [sess[@"rounds"] isKindOfClass:[NSArray class]] ? sess[@"rounds"] : @[];
+    if (rounds.count == 0) {
+        [self addLog:@"[CSV]" detail:@"当前场次暂无开奖记录"];
         return;
     }
     NSMutableString *csv = [NSMutableString stringWithString:@"\ufeff时间,房间号,局号,虎总押,芦总押,狮总押,蟹总押,鱼总押,虾总押,开奖1,开奖2,庄家盈亏,理论盈亏,账目校验\n"];
-    for (NSDictionary *record in self.roundRecords) {
-        NSArray *bets = [record[@"bets"] isKindOfClass:[NSArray class]] ? record[@"bets"] : @[@0, @0, @0, @0, @0, @0];
+    for (NSDictionary *r in [rounds reverseObjectEnumerator]) {
+        NSArray *bets = [r[@"bets"] isKindOfClass:[NSArray class]] ? r[@"bets"] : @[@0, @0, @0, @0, @0, @0];
         NSMutableString *line = [NSMutableString string];
-        [line appendFormat:@"%@,%@,%@", ACCsvField(record[@"time"]), ACCsvField(record[@"room"]), ACCsvField(record[@"round"])];
+        [line appendFormat:@"%@,%@,%@", ACCsvField(r[@"time"]), ACCsvField(sess[@"room"]), ACCsvField(r[@"round"])];
         for (int i = 0; i < 6; i++) {
             double v = i < (NSInteger)bets.count ? [bets[i] doubleValue] : 0;
             [line appendFormat:@",%.0f", v];
         }
         [line appendFormat:@",%@,%@,%@,%.0f,%@",
-         ACDiceName([record[@"d1"] integerValue]),
-         ACDiceName([record[@"d2"] integerValue]),
-         ACCsvField(record[@"profit"]),
-         [record[@"expect"] doubleValue],
-         ACCsvField(record[@"verify"])];
+         ACDiceName([r[@"d1"] integerValue]),
+         ACDiceName([r[@"d2"] integerValue]),
+         ACCsvField(r[@"profit"]),
+         [r[@"expect"] doubleValue],
+         ACCsvField(r[@"verify"])];
         [csv appendFormat:@"%@\n", line];
     }
 
-    NSString *fileName = [NSString stringWithFormat:@"rounds_%.0f.csv", [[NSDate date] timeIntervalSince1970]];
+    NSString *fileName = [NSString stringWithFormat:@"room_%@_%.0f.csv", sess[@"room"], [[NSDate date] timeIntervalSince1970]];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
     [csv writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [self presentShareForFile:path sourceRect:CGRectMake(94, 5, 60, 30)];
+    [self presentShareForFile:path sourceRect:CGRectMake(self.panelView.bounds.size.width - 125, 4, 65, 28)];
 }
 
-- (void)clearLogs {
-    [self.logDataSource removeAllObjects];
-    if (self.logTableView) [self.logTableView reloadData];
-}
+#pragma mark - 拖动
 
-- (void)addLog:(NSString *)title detail:(NSString *)detail {
-    // 跨线程前先复制，避免调用方临时字符串在异步切换后失效
-    NSString *safeTitle = title ? [NSString stringWithFormat:@"%@", title] : @"";
-    NSString *safeDetail = detail ? [NSString stringWithFormat:@"%@", detail] : @"";
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        fmt.dateFormat = @"HH:mm:ss.SSS";
-        NSString *timeStr = [fmt stringFromDate:[NSDate date]] ?: @"";
-
-        NSDictionary *item = @{
-            @"time": timeStr,
-            @"title": safeTitle,
-            @"detail": safeDetail
-        };
-        [self.logDataSource insertObject:item atIndex:0];
-        if (self.logDataSource.count > 200) [self.logDataSource removeLastObject];
-        if (self.logTableView) [self.logTableView reloadData];
-    });
-}
-
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint translation = [pan translationInView:self.floatWindow];
+- (void)handleBtnPan:(UIPanGestureRecognizer *)pan {
+    CGPoint t = [pan translationInView:self.floatWindow];
     CGRect frame = self.floatWindow.frame;
-    frame.origin.x += translation.x;
-    frame.origin.y += translation.y;
+    frame.origin.x += t.x;
+    frame.origin.y += t.y;
     self.floatWindow.frame = frame;
     [pan setTranslation:CGPointMake(0, 0) inView:self.floatWindow];
 }
@@ -629,43 +774,21 @@ static NSString *ACCsvField(NSString *value) {
 - (void)handlePanelPan:(UIPanGestureRecognizer *)pan {
     UIView *superview = self.panelView.superview;
     if (!superview) return;
-    CGPoint translation = [pan translationInView:superview];
-    self.panelView.center = CGPointMake(self.panelView.center.x + translation.x,
-                                        self.panelView.center.y + translation.y);
+    CGPoint t = [pan translationInView:superview];
+    self.panelView.center = CGPointMake(self.panelView.center.x + t.x, self.panelView.center.y + t.y);
     [pan setTranslation:CGPointMake(0, 0) inView:superview];
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
-    if (gestureRecognizer.view == self.panelView && touch.view && [touch.view isDescendantOfView:self.logTableView]) {
-        return NO; // 列表区域留给滚动
+    if (gestureRecognizer.view == self.panelView && touch.view) {
+        if ([touch.view isDescendantOfView:self.mainTableView]) return NO;
+        if ([touch.view isDescendantOfView:self.analyticsTextView]) return NO;
     }
     return YES;
 }
 
-- (void)togglePanel {
-    if (!self.panelView) [self setupUI];
-    self.panelView.hidden = !self.panelView.hidden;
-}
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.logDataSource.count;
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"LogCell"];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"LogCell"];
-        cell.backgroundColor = [UIColor clearColor];
-        cell.textLabel.textColor = [UIColor systemYellowColor];
-        cell.textLabel.font = [UIFont boldSystemFontOfSize:11];
-        cell.detailTextLabel.textColor = [UIColor whiteColor];
-        cell.detailTextLabel.font = [UIFont systemFontOfSize:10];
-        cell.detailTextLabel.numberOfLines = 2;
-    }
-    NSDictionary *item = self.logDataSource[indexPath.row];
-    cell.textLabel.text = [NSString stringWithFormat:@"[%@] %@", item[@"time"], item[@"title"]];
-    cell.detailTextLabel.text = item[@"detail"];
-    return cell;
+- (void)addLog:(NSString *)title detail:(NSString *)detail {
+    NSLog(@"[FloatingMenu] %@ %@", title, detail);
 }
 
 @end
@@ -686,32 +809,21 @@ static NSString *const kACHTTPHandled = @"ACHTTPHandled";
     return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
 }
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 
 - (void)startLoading {
     NSMutableURLRequest *req = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:kACHTTPHandled inRequest:req];
-
     NSString *body = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
-    if (body.length > 2000) body = [body substringToIndex:2000];
+    if (body.length > 1000) body = [body substringToIndex:1000];
     [[DebugFloatWindow sharedInstance] addLog:[NSString stringWithFormat:@"[HTTP %@]", req.HTTPMethod ?: @"GET"]
-                                       detail:[NSString stringWithFormat:@"%@\n%@", req.URL.absoluteString, body ?: @""]];
-
+                                       detail:[NSString stringWithFormat:@"%@ %@", req.URL.absoluteString, body ?: @""]];
     self.conn = [NSURLConnection connectionWithRequest:req delegate:self];
 }
 
-- (void)stopLoading {
-    [self.conn cancel];
-}
+- (void)stopLoading { [self.conn cancel]; }
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
-    if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-        [[DebugFloatWindow sharedInstance] addLog:[NSString stringWithFormat:@"[HTTP %ld]", (long)http.statusCode]
-                                           detail:http.URL.absoluteString];
-    }
     [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
 }
 
@@ -724,13 +836,12 @@ static NSString *const kACHTTPHandled = @"ACHTTPHandled";
 }
 
 - (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error {
-    [[DebugFloatWindow sharedInstance] addLog:@"[HTTP 失败]" detail:error.localizedDescription ?: @""];
     [self.client URLProtocol:self didFailWithError:error];
 }
 
 @end
 
-#pragma mark - WebSocket 监听
+#pragma mark - WebSocket Hook
 
 @interface NSObject (ACWebSocketLog)
 - (void)ac_logSendString:(NSString *)str;
@@ -787,14 +898,9 @@ static void ACInstallWebSocketHooks(void) {
 
     Class sendCls = ACFindClassWithMethod(@"WebSocket", @selector(sendString:));
     if (!sendCls) sendCls = ACFindClassWithMethod(@"Socket", @selector(sendString:));
-    if (!sendCls) {
-        Class named = NSClassFromString(@"WebSocketImpl");
-        if (named && ACHasMethod(named, @selector(sendString:))) sendCls = named;
-    }
     if (sendCls) {
         ACSwizzleMethod(sendCls, @selector(sendString:), @selector(ac_logSendString:));
-        [[DebugFloatWindow sharedInstance] addLog:@"[WS Hook]"
-                                           detail:[NSString stringWithFormat:@"已挂载发送监听: %s", class_getName(sendCls)]];
+        NSLog(@"[FloatingMenu] WS 发送监听: %s", class_getName(sendCls));
     }
 
     SEL recvSel = NSSelectorFromString(@"webSocket:didReceiveMessageWithString:");
@@ -802,15 +908,10 @@ static void ACInstallWebSocketHooks(void) {
     if (!recvCls) recvCls = ACFindClassWithMethod(@"Socket", recvSel);
     if (recvCls) {
         ACSwizzleMethod(recvCls, recvSel, @selector(ac_logWebSocket:didReceiveMessageWithString:));
-        [[DebugFloatWindow sharedInstance] addLog:@"[WS Hook]"
-                                           detail:[NSString stringWithFormat:@"已挂载接收监听: %s", class_getName(recvCls)]];
+        NSLog(@"[FloatingMenu] WS 接收监听: %s", class_getName(recvCls));
     }
 
-    if (sendCls || recvCls) {
-        installed = YES;
-    } else {
-        [[DebugFloatWindow sharedInstance] addLog:@"[WS Hook]" detail:@"尚未找到 WebSocket 类，稍后重试"];
-    }
+    if (sendCls || recvCls) installed = YES;
 }
 
 __attribute__((constructor))
